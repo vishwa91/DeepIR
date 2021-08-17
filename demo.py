@@ -26,8 +26,8 @@ import thermal
 if __name__ == '__main__':
     imname = 'test1'                # Name of the test file name
     camera = 'sim'                  # 'sim', 'boson' or 'lepton' 
-    scale_sr = 4                    # 1 for denoising/NUC, 2, 3, .. for SR
-    nimg = 10                       # Number of input images
+    scale_sr = 1                    # 1 for denoising/NUC, 2, 3, .. for SR
+    nimg = 5                        # Number of input images
     
     # Load config file -- 
     config = dataset.load_config('configs/dip_%s.ini'%camera)
