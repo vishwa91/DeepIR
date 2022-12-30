@@ -7,10 +7,12 @@ Deep InfraRed image processing framework
 Thermal images captured by uncooled microbolometer cameras suffer from non-uniform noise that leads to severe loss in spatial resolution. We identify that thermal images can be factored into a scene-dependent flux that is concisely modeled as outputs of deep networks, and a scene-independent and slowly varying non-uniformity. By capturing multiple images with small camera motion, we are able to estimate the high quality thermal image. 
 
 ## Paper
-*Coming soon*
+[arXiv paper link](https://arxiv.org/abs/2108.07973)
 
 ## Requirements
 See `requirements.txt`.
+
+Parts of `modules/thermal.py` have been changed due to API changes in `kornia` library.
 
 ## Usage
 - If you want to run on simulated images, we have included two Boson images in the `data/` folder.
@@ -23,6 +25,7 @@ scale_sr = 1        # Set scale to 1 for denoising, higher integers
                     # for super resolution
 nimg = 5            # Number of input images. For denoising, 3 - 5 suffice,
                     # but for super resolution, you may need more.
+method = 'dip'      # 'dip' for DeepIR and 'cvx' for a variant of Hardie et al. with convex optimization
 ````
 - We have provided default configuration files in `configs/`, you may edit them as you see fit.
 

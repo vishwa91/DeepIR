@@ -236,7 +236,7 @@ def textfunc(im, txt):
 def get_img(imname, scaling):
     # Read image
     im = cv2.resize(plt.imread('data/%s.png'%imname), None,
-                    fx=scaling, fy=scaling)**2
+                    fx=scaling, fy=scaling)
     
     if im.ndim == 2:
         im = im[:, :, np.newaxis]

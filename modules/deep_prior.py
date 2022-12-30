@@ -16,10 +16,10 @@ from torch import nn
 import torchvision
 import cv2
 
-from models.skip import skip
-from models.texture_nets import get_texture_nets
-from models.resnet import ResNet
-from models.unet import UNet
+from dmodels.skip import skip
+from dmodels.texture_nets import get_texture_nets
+from dmodels.resnet import ResNet
+from dmodels.unet import UNet
 
 class Downsampler(nn.Module):
     '''

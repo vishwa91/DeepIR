@@ -118,7 +118,7 @@ def reg_avg_denoise(imstack, ecc_mats=None):
     imten = torch.tensor(imstack.astype(np.float32))[:, None, ...]
     ecc_ten = torch.tensor(ecc_inv.astype(np.float32))
     
-    imwarped = kornia.warp_affine(imten, ecc_ten, (H, W), flags='bilinear')
+    imwarped = kornia.geometry.warp_affine(imten, ecc_ten, (H, W), flags='bilinear')
     im_denoised = imwarped.mean(0)[0, ...].numpy()
     weights = (imwarped > 0).type(torch.float32).mean(0)[0, ...].numpy()
     weights[weights == 0] = 1
@@ -275,15 +275,15 @@ def interp_DIP(imstack, reg_stack, hr_size, params_dict):
         img_hr_cat = torch.repeat_interleave(img_hr, nimg, 0)
         
         if params_dict['integrator'] == 'area':
-            img_hr_affine = kornia.warp_affine(img_hr_cat, affine_param,
+            img_hr_affine = kornia.geometry.warp_affine(img_hr_cat, affine_param,
                                             (H, W), align_corners=True)
             img_lr = F.interpolate(img_hr_affine, (Hl, Wl), mode='area')
         elif params_dict['integrator'] == 'learnable':
-            img_hr_affine = kornia.warp_affine(img_hr_cat, affine_param,
+            img_hr_affine = kornia.geometry.warp_affine(img_hr_cat, affine_param,
                                             (H, W), align_corners=True)
             img_lr = integrator(img_hr_affine)
         else:
-            img_lr = kornia.warp_affine(img_hr_cat,
+            img_lr = kornia.geometry.warp_affine(img_hr_cat,
                                         affine_param/scale_sr,
                                         (Hl, Wl), align_corners=False)
                     
@@ -356,7 +356,7 @@ def interp_DIP(imstack, reg_stack, hr_size, params_dict):
         model.load_state_dict(best_state_dict)
         img_and_gain = model(model_input)
         img_hr = img_and_gain[[0], [0], ...].reshape(1, 1, H, W)
-        img_hr = kornia.warp_affine(img_hr,
+        img_hr = kornia.geometry.warp_affine(img_hr,
                                     affine_param[[0], ...], (H, W))
         img_hr = img_hr.cpu().detach().numpy().reshape(H, W)
         
@@ -383,5 +383,184 @@ def interp_DIP(imstack, reg_stack, hr_size, params_dict):
                'ecc_mats': affine_param.detach().cpu().numpy(),
                'gain': gain,
                'offset': offset}
+    
+    return img_hr, profile
+
+
+def interp_convex(imstack, reg_stack, hr_size, params_dict):
+    '''
+        Super resolve from a stack of images using convex optimization
+        
+        Inputs:
+            imstack: (nimg, Hl, Wl) stack of low resolution images
+            reg_stack: (nimg, 2, 3) stack of affine matrices
+            hr_size: High resolution image size
+            params_dict: Dictionary containing parameters for optimization
+                niters: Number of SIREN iterations
+                batch_size: Batch size of data
+                num_workers: Workers for data loading
+                learning_rate: Learning rate for optimization
+                prior_type: tv, or hessian
+                lambda_prior: Prior weight
+                optimize_reg: If True, optimize registration parameters
+                visualize: If True, visualize reconstructions at each iteration
+                gt: If visualize is true, gt is the ground truth image
+                reg_final: If True, register the final result to gt
+                lpip_func: If gt is true, evaluate perceptual similarity with
+                    this function
+            
+        Returns:
+            im_hr: High resolution image
+            profile: Dictionary containing the following:
+                loss_array: Array with loss at each iteration
+                trained_model: State dictionary for best model
+                metrics: if gt is provided, this is a dictionary with:
+                    snrval: SNR of reconstruction
+                    psnrval: Peak SNR 
+                    ssimval: SSIM
+                    lpipval: VGG perceptual metrics
+                    
+    '''
+    nimg, Hl, Wl = imstack.shape
+    H, W = hr_size
+    
+    scale_sr = 0.5*(H/Hl + W/Wl)
+    
+    # Internal constant
+    img_every = 10
+    lambda_offset = 10
+    
+    # Create loss functions
+    criterion_fidelity = losses.L2Norm()
+    if params_dict['prior_type'] == 'tv':
+        criterion_prior = losses.TVNorm()
+    elif params_dict['prior_type'] == 'hessian':
+        criterion_prior = losses.HessianNorm()
+    elif params_dict['prior_type'] == 'l2':
+        criterion_prior = losses.L2Norm()
+    else:
+        raise ValueError('Prior not implemented')
+    
+    # Initialize solution with linear interpolation
+    #im_init = torch.tensor(interp_SR(imstack, reg_stack, hr_size))
+    im_init = torch.rand(H, W)
+    gain_init = torch.rand(Hl, Wl)
+    offset_init = torch.ones(Hl, Wl)*1e-2
+    
+    # Create the variable
+    img_hr_param = torch.autograd.Variable(im_init[None, None, ...],
+                                           requires_grad=True).cuda()
+    img_hr_param = torch.nn.Parameter(img_hr_param)
+    
+    # Create gain parameter
+    gain_param = torch.autograd.Variable(gain_init[None, None, ...],
+                                         requires_grad=True).cuda()
+    gain_param = torch.nn.Parameter(gain_param)
+    
+    # Create offset parameter
+    offset_param = torch.autograd.Variable(offset_init[None, None, ...],
+                                           requires_grad=True).cuda()
+    offset_param = torch.nn.Parameter(offset_param)
+        
+    # Create parameters from affine matrices
+    affine_mat = torch.tensor(reg_stack).cuda()
+    affine_var = torch.autograd.Variable(affine_mat, requires_grad=True).cuda()
+    affine_param = torch.nn.Parameter(affine_var)
+    
+    params = [img_hr_param] + [gain_param] + [offset_param]
+    
+    if params_dict['optimize_reg']:
+        params += [affine_param]
+        #params += [angles_param] + [translations_param]
+        
+    # Create an ADAM optimizer
+    optimizer = torch.optim.Adam(lr=params_dict['learning_rate'],
+                                 params=params)
+        
+    loss_array = np.zeros(params_dict['niters'])
+
+    gt = torch.tensor(imstack).cuda()[:, None, ...]
+    for epoch in tqdm.tqdm(range(params_dict['niters'])):            
+        # Generate low resolution images
+        img_hr_cat = torch.repeat_interleave(img_hr_param, gt.shape[0], 0)
+        
+        if params_dict['integrator'] == 'area':
+            img_hr_affine = kornia.geometry.warp_affine(img_hr_cat, affine_param,
+                                        (H, W), align_corners=False)
+            img_lr = F.interpolate(img_hr_affine, (Hl, Wl), mode='area')
+        else:
+            img_lr = kornia.geometry.warp_affine(img_hr_cat,
+                                        affine_param/scale_sr,
+                                        (Hl, Wl), align_corners=False)
+        gain_cat = torch.repeat_interleave(gain_param, gt.shape[0], 0)
+        #offset_cat = torch.repeat_interleave(offset_param, gt.shape[0], 0)
+        
+        masks = img_lr > 0
+        
+        #if epoch > params_dict['niters']:
+        #    img_lr  = img_lr*(gain_cat + offset_cat)
+        #else:
+        img_lr = img_lr + gain_cat
+        
+        mse_loss = criterion_fidelity(img_lr, gt)
+        prior_loss = criterion_prior(img_hr_param)
+        #offset_loss = criterion_prior(offset_param)
+        
+        loss = mse_loss + params_dict['lambda_prior']*prior_loss
+         #   lambda_offset*offset_loss
+                    
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        
+        train_loss = loss.item()
+
+        loss_array[epoch] = train_loss
+        
+        if params_dict['visualize']:
+            if epoch%img_every == 0:
+                img_hr_cpu = img_hr_param.cpu().detach().numpy().reshape(H, W)
+                    
+                v_idx = np.random.randint(nimg)
+                img_lr_cpu = img_lr[v_idx, ...]
+                img_lr_cpu = img_lr_cpu.cpu().detach().numpy().reshape(Hl, Wl)
+                gain = gain_param.cpu().detach().numpy().reshape(Hl, Wl)
+                offset = offset_param.cpu().detach().numpy().reshape(Hl, Wl)
+                
+                snrval = utils.psnr(params_dict['gt'], img_hr_cpu)
+                ssimval = ssim_func(params_dict['gt'], img_hr_cpu)
+                
+                txt = 'PSNR: %.1f | SSIM: %.2f'%(snrval, ssimval)
+                
+                img_hr_ann = utils.textfunc(img_hr_cpu, txt)
+                imcat = np.hstack((imstack[v_idx, ...], img_lr_cpu,
+                                   gain, offset/offset.max()))
+                imcat_full = np.hstack((params_dict['gt'], img_hr_ann))
+                
+                cv2.imshow('Recon LR', np.clip(imcat, 0, 1))
+                cv2.imshow('Recon HR', np.clip(imcat_full, 0, 1))
+                cv2.waitKey(1)
+                
+    # We are done, obtain the best model
+    with torch.no_grad():
+        img_hr = kornia.geometry.warp_affine(img_hr_param, affine_param[[0], ...],
+                                    (H, W))
+        img_hr = img_hr_param.cpu().detach().numpy().reshape(H, W)
+        gain = gain_param.cpu().detach().numpy().reshape(Hl, Wl)
+        offset = offset_param.cpu().detach().numpy().reshape(Hl, Wl)
+        
+    # In case there's a shift in reconstruction
+    if params_dict['reg_final'] and 'gt' in params_dict:
+        try:
+            img_hr = motion.ecc_flow(params_dict['gt'], img_hr)[1]
+        except:
+            pass
+        
+    # If ground truth is provided, return metrics
+    if 'gt' in params_dict:
+        metrics = get_metrics(params_dict['gt'], img_hr)
+        
+    profile = {'loss_array': loss_array, 'metrics': metrics,
+               'gain': gain, 'offset': offset}
     
     return img_hr, profile
